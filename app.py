@@ -10,7 +10,19 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 # Inicializa banco SQLite
-DB_PATH = 'fatura.db'
+
+
+st.sidebar.title("👤 Identificação do Usuário")
+usuario = st.sidebar.text_input("Digite seu nome (sem espaços):").strip().lower()
+if not usuario:
+    st.sidebar.error("Por favor, insira seu nome para continuar.")
+    st.stop()
+if 'usuario' not in st.session_state:
+    st.session_state['usuario'] = usuario
+    
+
+DB_PATH = f'fatura_{usuario}.db'
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
