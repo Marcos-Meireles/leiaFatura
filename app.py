@@ -87,6 +87,23 @@ def gerar_excel(df, caminho, lista_pessoas, total_individual):
 st.set_page_config(page_title="Divisor de Fatura", layout="wide")
 st.title("🧾 Divisão de Fatura de Cartão")
 
+
+# 🔹 Instruções para exportar a fatura da Nubank
+with st.expander("📋 Como exportar sua fatura Nubank em CSV"):
+    st.markdown("""
+    ### Passo a passo:
+    1. **Acesse o aplicativo Nubank:** Abra o app Nubank no seu celular.
+    2. **Resumo de Faturas:** Vá em **Cartão de Crédito** > **Resumo de Faturas**.
+    3. **Selecione o mês desejado:** Escolha o mês da fatura que você deseja exportar.
+    4. **Ícone de envio:** Toque no ícone de envio (no canto superior direito da tela).
+    5. **Escolha o formato CSV:** Selecione **CSV** como formato de exportação.
+
+    ### ℹ️ Observações:
+    - A opção de exportar em CSV **só aparece para faturas já fechadas**.
+    - O arquivo CSV será enviado por e-mail para o endereço **cadastrado na sua conta Nubank**.
+    """)
+
+# Upload do arquivo CSV
 file = st.file_uploader("📤 Faça upload da fatura (.csv com colunas 'date', 'title', 'amount')", type="csv")
 
 if file:
