@@ -1,0 +1,18 @@
+# Bancos de dados locais (histórico de classificações por usuário)
+*.db
+
+# Ambiente virtual
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
