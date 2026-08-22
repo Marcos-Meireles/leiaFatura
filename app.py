@@ -4,204 +4,360 @@ import pandas as pd
 import sqlite3
 import os
 import re
+import json
 from datetime import datetime
-from openpyxl import load_workbook, Workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-# Inicializa banco SQLite
+st.set_page_config(page_title="Divisor de Fatura", layout="wide")
 
-
-st.sidebar.title("👤 Identificação do Usuário")
-usuario = st.sidebar.text_input("Digite seu nome (sem espaços):").strip().lower()
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.title("👤 Identificação")
+usuario = st.sidebar.text_input("Seu nome (sem espaços):").strip().lower()
 if not usuario:
-    st.sidebar.error("Por favor, insira seu nome para continuar.")
+    st.sidebar.error("Insira seu nome para continuar.")
     st.stop()
-if 'usuario' not in st.session_state:
-    st.session_state['usuario'] = usuario
-    
 
 DB_PATH = f'fatura_{usuario}.db'
 
+# ── Banco de dados ────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS transacoes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        descricao_base TEXT,
-        valor REAL,
-        parcelas TEXT,
-        beneficiario TEXT,
-        categoria TEXT
-    )''')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS historico (
+            norm        TEXT PRIMARY KEY,
+            categoria   TEXT,
+            dividir_com TEXT
+        )
+    ''')
+    # Migrar dados antigos da tabela transacoes, se existir
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transacoes'")
+    if c.fetchone():
+        c.execute("SELECT COUNT(*) FROM historico")
+        if c.fetchone()[0] == 0:
+            try:
+                c.execute("""
+                    INSERT OR IGNORE INTO historico (norm, categoria, dividir_com)
+                    SELECT descricao_norm, categoria, dividir_com
+                    FROM transacoes
+                    WHERE descricao_norm IS NOT NULL AND categoria IS NOT NULL
+                """)
+            except Exception:
+                pass
     conn.commit()
-    return conn, cursor
+    return conn
+
+def carregar_historico(conn):
+    c = conn.cursor()
+    c.execute("SELECT norm, categoria, dividir_com FROM historico")
+    return {
+        norm: {
+            'categoria': cat or '',
+            'dividir_com': json.loads(div) if div else []
+        }
+        for norm, cat, div in c.fetchall()
+    }
+
+def salvar_historico(conn, norm, categoria, dividir_com):
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO historico (norm, categoria, dividir_com) VALUES (?, ?, ?)
+        ON CONFLICT(norm) DO UPDATE SET
+            categoria   = excluded.categoria,
+            dividir_com = excluded.dividir_com
+    """, (norm, categoria, json.dumps(dividir_com, ensure_ascii=False)))
+    conn.commit()
+
+def limpar_historico(conn):
+    conn.cursor().execute("DELETE FROM historico")
+    conn.commit()
+
+# ── Parsing e normalização ────────────────────────────────────────────────────
+def parse_valor(s):
+    """Converte formato brasileiro: '- 1.037,52' → -1037.52"""
+    s = str(s).replace(' ', '').replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 def extrair_parcela(desc):
-    match = re.search(r'Parcela\s+(\d+)/(\d+)', desc, re.IGNORECASE)
-    return f"{match.group(1)}/{match.group(2)}" if match else ''
+    """Captura 'X/Y' de '- Parcela X/Y' no final da descrição."""
+    m = re.search(r'-\s*Parcela\s+(\d+)/(\d+)', desc, re.IGNORECASE)
+    return f"{m.group(1)}/{m.group(2)}" if m else ''
 
-def gerar_excel(df, caminho, lista_pessoas, total_individual):
+def normalizar_desc(desc):
+    """Remove o sufixo de parcela para agrupar compras parceladas.
+    'Amazon - Parcela 3/6' → 'amazon'
+    'Uber - NuPay'         → 'uber - nupay'
+    """
+    d = re.sub(r'\s*-\s*Parcela\s+\d+/\d+\s*$', '', desc, flags=re.IGNORECASE)
+    return ' '.join(d.split()).lower()
+
+# ── Exportação Excel ──────────────────────────────────────────────────────────
+def gerar_excel(df, caminho, lista_pessoas, usuario):
     wb = Workbook()
+    hfill = PatternFill(start_color='DCE6F1', fill_type='solid')
+
+    def estilizar_header(ws, n_cols):
+        for col in range(1, n_cols + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.font = Font(bold=True)
+            cell.fill = hfill
+        for col in range(1, n_cols + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 22
+
+    # Aba principal
     ws = wb.active
     ws.title = "Fatura Dividida"
-
-    header = ['Data', 'Descrição', 'Parcela', 'Valor', 'Dividido por', 'Valor por Pessoa']
-    ws.append(header)
-    for col in range(1, len(header) + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color='DCE6F1', fill_type='solid')
-
+    cols = ['Data', 'Descrição', 'Parcela', 'Categoria', 'Valor (R$)', 'Divide com', 'Valor por pessoa']
+    ws.append(cols)
+    estilizar_header(ws, len(cols))
     for _, row in df.iterrows():
         ws.append([
             row['Data'].strftime('%d/%m/%Y'),
             row['Descrição'],
             row['Parcela'],
+            row['Categoria'],
             row['Valor'],
-            ", ".join(row['DivididoPor']),
-            row['ValorPorPessoa']
+            ', '.join(row['DivididoCom']),
+            row['ValorPorPessoa'],
         ])
 
-    for col in range(1, 7):
-        ws.column_dimensions[get_column_letter(col)].width = 20
+    # Aba "O que me devem"
+    outros = [p for p in lista_pessoas if p != usuario]
+    if outros:
+        ws_t = wb.create_sheet("O que me devem")
+        ws_t.append(["Pessoa", "Deve (R$)"])
+        estilizar_header(ws_t, 2)
+        for pessoa in outros:
+            total = sum(r['ValorPorPessoa'] for _, r in df.iterrows() if pessoa in r['DivididoCom'])
+            ws_t.append([pessoa.title(), round(total, 2)])
 
-    # Criar aba Totais
-    ws_totais = wb.create_sheet("Totais")
-    ws_totais.append(["Pessoa", "Total (R$)"])
-    for pessoa, total in total_individual.items():
-        ws_totais.append([pessoa, total])
-    for col in range(1, 3):
-        ws_totais.column_dimensions[get_column_letter(col)].width = 20
-
-    # Criar uma aba por pessoa
+    # Aba por pessoa
     for pessoa in lista_pessoas:
-        ws_pessoa = wb.create_sheet(title=pessoa[:31])  # Excel limita nome da aba a 31 caracteres
-        ws_pessoa.append(['Data', 'Descrição', 'Parcela', 'Valor total', 'Participantes', 'Valor pago por essa pessoa'])
-
+        titulo = f"{pessoa[:28]} ({'eu' if pessoa == usuario else 'deve'})"
+        ws_p = wb.create_sheet(title=titulo[:31])
+        cols_p = ['Data', 'Descrição', 'Parcela', 'Categoria', 'Valor total', 'Divide com', 'Valor pago']
+        ws_p.append(cols_p)
+        estilizar_header(ws_p, len(cols_p))
         for _, row in df.iterrows():
-            if pessoa in row['DivididoPor']:
-                ws_pessoa.append([
+            if pessoa in row['DivididoCom']:
+                ws_p.append([
                     row['Data'].strftime('%d/%m/%Y'),
                     row['Descrição'],
                     row['Parcela'],
+                    row['Categoria'],
                     row['Valor'],
-                    ", ".join(row['DivididoPor']),
-                    row['ValorPorPessoa']
+                    ', '.join(row['DivididoCom']),
+                    row['ValorPorPessoa'],
                 ])
-
-        for col in range(1, 7):
-            ws_pessoa.column_dimensions[get_column_letter(col)].width = 20
 
     wb.save(caminho)
 
-# Interface Streamlit
-st.set_page_config(page_title="Divisor de Fatura", layout="wide")
+# ── Interface principal ───────────────────────────────────────────────────────
 st.title("🧾 Divisão de Fatura de Cartão")
 
-
-# 🔹 Instruções para exportar a fatura da Nubank
 with st.expander("📋 Como exportar sua fatura Nubank em CSV"):
     st.markdown("""
-    ### Passo a passo:
-    1. **Acesse o aplicativo Nubank:** Abra o app Nubank no seu celular.
-    2. **Resumo de Faturas:** Vá em **Cartão de Crédito** > **Resumo de Faturas**.
-    3. **Selecione o mês desejado:** Escolha o mês da fatura que você deseja exportar.
-    4. **Ícone de envio:** Toque no ícone de envio (no canto superior direito da tela).
-    5. **Escolha o formato CSV:** Selecione **CSV** como formato de exportação.
-
-    ### ℹ️ Observações:
-    - A opção de exportar em CSV **só aparece para faturas já fechadas**.
-    - O arquivo CSV será enviado por e-mail para o endereço **cadastrado na sua conta Nubank**.
+    1. Abra o app Nubank → **Cartão de Crédito** → **Resumo de Faturas**.
+    2. Selecione o mês (só faturas **fechadas** têm opção CSV).
+    3. Toque no ícone de envio (canto superior direito) → **CSV**.
+    4. O arquivo chega por e-mail no endereço cadastrado na Nubank.
     """)
 
-# Upload do arquivo CSV
-file = st.file_uploader("📤 Faça upload da fatura (.csv com colunas 'date', 'title', 'amount')", type="csv")
+file = st.file_uploader("📤 Upload da fatura Nubank (.csv)", type="csv")
 
 if file:
-    df = pd.read_csv(file)
-    df.rename(columns={'date': 'Data', 'title': 'Descrição', 'amount': 'Valor'}, inplace=True)
-    df['Data'] = pd.to_datetime(df['Data'])
-    df['Parcela'] = df['Descrição'].apply(extrair_parcela)
+    raw = pd.read_csv(file)
+    raw.rename(columns={'date': 'Data', 'title': 'Descrição', 'amount': 'Valor'}, inplace=True)
+    raw['Data'] = pd.to_datetime(raw['Data'])
+    raw['Valor'] = raw['Valor'].apply(parse_valor)
+    raw['Parcela'] = raw['Descrição'].apply(extrair_parcela)
+    raw['DescNorm'] = raw['Descrição'].apply(normalizar_desc)
 
-    conn, cursor = init_db()
+    # Separar por tipo
+    is_pagamento = raw['Descrição'].str.contains('pagamento recebido', case=False, na=False)
+    pagamentos = raw[is_pagamento].copy()
+    nao_pagamento = raw[~is_pagamento]
+    compras = nao_pagamento[nao_pagamento['Valor'] > 0].copy().reset_index(drop=True)
+    estornos = nao_pagamento[nao_pagamento['Valor'] < 0].copy()
 
-    st.subheader("📌 Classifique e divida os itens")
-    pessoas = st.text_input("👥 Informe os nomes das pessoas para divisão, separados por vírgula:")
-    lista_pessoas = [p.strip() for p in pessoas.split(',') if p.strip()]
+    conn = init_db()
+    historico = carregar_historico(conn)
 
-    dividido_por = []
-    valor_por_pessoa = []
+    # ── Sidebar: histórico ─────────────────────────────────────────────────
+    with st.sidebar.expander("🗃️ Histórico de classificações"):
+        st.write(f"Entradas salvas: **{len(historico)}**")
+        if historico:
+            st.dataframe(pd.DataFrame([
+                {'Descrição base': k, 'Categoria': v['categoria']}
+                for k, v in historico.items()
+            ]), use_container_width=True)
+        if st.button("🗑️ Limpar histórico"):
+            limpar_historico(conn)
+            st.rerun()
 
-    for i, row in df.iterrows():
-        descricao = row['Descrição']
+    # ── Outras pessoas ─────────────────────────────────────────────────────
+    st.subheader("👥 Configuração")
+    outros_input = st.text_input(
+        "Com quem você divide despesas? (nomes separados por vírgula)",
+        placeholder="ex: pedro, maria"
+    )
+    outros = [p.strip().lower() for p in outros_input.split(',') if p.strip()]
+    lista_pessoas = [usuario] + outros  # usuário sempre incluso
+
+    # Estornos/reembolsos (negativos que não são pagamento da fatura)
+    if not estornos.empty:
+        total_estornos = estornos['Valor'].sum()
+        with st.expander(f"↩️ {len(estornos)} estorno(s) / reembolso(s) — total: R$ {total_estornos:.2f}"):
+            disp_est = estornos[['Data', 'Descrição', 'Valor']].copy()
+            disp_est['Data'] = disp_est['Data'].dt.strftime('%d/%m/%Y')
+            disp_est['Valor'] = disp_est['Valor'].apply(lambda x: f'R$ {x:.2f}')
+            st.dataframe(disp_est, use_container_width=True)
+            st.caption("Esses valores reduzem o total líquido da fatura.")
+
+    # Pagamento da fatura (ignorado)
+    if not pagamentos.empty:
+        with st.expander(f"ℹ️ {len(pagamentos)} pagamento(s) de fatura ignorado(s)"):
+            disp_pag = pagamentos[['Data', 'Descrição', 'Valor']].copy()
+            disp_pag['Data'] = disp_pag['Data'].dt.strftime('%d/%m/%Y')
+            disp_pag['Valor'] = disp_pag['Valor'].apply(lambda x: f'R$ {x:.2f}')
+            st.dataframe(disp_pag, use_container_width=True)
+
+    # ── Métricas ───────────────────────────────────────────────────────────
+    n_rec = sum(1 for _, r in compras.iterrows() if r['DescNorm'] in historico)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("📋 Total de compras", len(compras))
+    m2.metric("🔄 Com sugestão do histórico", n_rec)
+    m3.metric("🆕 Sem histórico", len(compras) - n_rec)
+
+    # ── Classificação por transação ────────────────────────────────────────
+    st.markdown("### 📋 Confirme cada compra")
+    st.caption(
+        f"Selecione quem divide cada despesa. "
+        f"Se deixar só **{usuario}**, é despesa pessoal sua — ninguém deve nada."
+    )
+
+    dividido_com_list = []
+    valor_por_pessoa_list = []
+    categoria_list = []
+    salvar_list = []
+
+    for i, row in compras.iterrows():
+        norm = row['DescNorm']
         valor = row['Valor']
         parcela = row['Parcela']
-        base = f"{descricao}|{valor}|{parcela}"
+        hist = historico.get(norm, {})
+        tem_hist = bool(hist)
 
-        cursor.execute("SELECT beneficiario, categoria FROM transacoes WHERE descricao_base=?", (base,))
-        resultado = cursor.fetchone()
+        prefixo = "✅" if tem_hist else "🆕"
+        label = f"{prefixo} {row['Descrição']} | R$ {valor:.2f}"
+        if parcela:
+            label += f" | Parcela {parcela}"
 
-        with st.expander(f"{descricao} | R$ {valor:.2f} | Parcela: {parcela or 'N/A'}"):
-            if resultado:
-                st.info("Transação reconhecida de outra fatura.")
-                beneficiar = resultado[0]
-                categoria = resultado[1]
+        with st.expander(label, expanded=not tem_hist):
+            if tem_hist:
+                st.caption("Sugestão do histórico — confirme ou ajuste.")
+
+            default_cat = hist.get('categoria', '')
+            hist_div = hist.get('dividir_com', [usuario])
+            default_div = [p for p in hist_div if p in lista_pessoas] or [usuario]
+
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                cat = st.text_input("Categoria", value=default_cat, key=f"cat_{i}",
+                                    placeholder="ex: transporte")
+            with col2:
+                div = st.multiselect("Quem divide?", options=lista_pessoas,
+                                     default=default_div, key=f"div_{i}")
+
+            div_com = div if div else [usuario]
+            vpp = round(valor / len(div_com), 2)
+
+            if len(div_com) == 1 and div_com[0] == usuario:
+                st.markdown(f"**💳 Despesa pessoal — R$ {valor:.2f} (só você)**")
             else:
-                beneficiar = st.selectbox("Beneficiário", lista_pessoas, key=f"b_{i}")
-                categoria = st.text_input("Categoria", key=f"cat_{i}")
+                devedores = [p for p in div_com if p != usuario]
+                partes = '  |  '.join(f'{p.title()}: R$ {vpp:.2f}' for p in devedores)
+                st.markdown(f"**💰 Cada um paga R$ {vpp:.2f}** — Você recebe de: {partes}")
 
-                if beneficiar and categoria:
-                    cursor.execute("INSERT INTO transacoes (descricao_base, valor, parcelas, beneficiario, categoria) VALUES (?, ?, ?, ?, ?)",
-                        (base, valor, parcela, beneficiar, categoria))
-                    conn.commit()
+            dividido_com_list.append(div_com)
+            valor_por_pessoa_list.append(vpp)
+            categoria_list.append(cat)
 
-            dividir_com = st.multiselect("Dividir com", options=lista_pessoas, default=[beneficiar], key=f"dividir_{i}")
-            dividido_por.append(dividir_com)
+            if cat:
+                salvar_list.append((norm, cat, div_com))
 
-            valor_unitario = round(valor / len(dividir_com), 2) if dividir_com else 0.0
-            valor_por_pessoa.append(valor_unitario)
-            st.markdown(f"**💰 Cada um paga: R$ {valor_unitario:.2f}**")
+    # Persistir histórico (somente se categoria preenchida)
+    for norm, cat, div_com in salvar_list:
+        salvar_historico(conn, norm, cat, div_com)
 
-    df['DivididoPor'] = dividido_por
-    df['ValorPorPessoa'] = valor_por_pessoa
+    compras['DivididoCom'] = dividido_com_list
+    compras['ValorPorPessoa'] = valor_por_pessoa_list
+    compras['Categoria'] = categoria_list
 
-    st.subheader("📊 Total por pessoa")
-    total_individual = {}
-    for index, row in df.iterrows():
-        for pessoa in row['DivididoPor']:
-            total_individual[pessoa] = total_individual.get(pessoa, 0) + row['ValorPorPessoa']
+    # ── Resumo ─────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Resumo")
 
-    total_df = pd.DataFrame.from_dict(total_individual, orient='index', columns=['Total (R$)'])
-    st.dataframe(total_df.style.format({'Total (R$)': 'R$ {:.2f}'}))
+    total_compras = compras['Valor'].sum()
+    total_estornos_val = estornos['Valor'].sum() if not estornos.empty else 0.0
+    total_liquido = total_compras + total_estornos_val
+    minha_parte = sum(
+        r['ValorPorPessoa'] for _, r in compras.iterrows() if usuario in r['DivididoCom']
+    ) + total_estornos_val  # estornos reduzem a sua parte
 
-    # 🧾 Detalhamento individual
-    st.subheader("🧾 Detalhamento do que cada pessoa está pagando")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🛒 Total de compras", f"R$ {total_compras:.2f}")
+    c2.metric("↩️ Estornos", f"R$ {total_estornos_val:.2f}")
+    c3.metric("💳 Total líquido", f"R$ {total_liquido:.2f}")
+
+    st.metric(f"💼 Minha parte ({usuario.title()})", f"R$ {minha_parte:.2f}")
+
+    if outros:
+        st.subheader("💸 O que cada pessoa deve a você")
+        cols_dev = st.columns(len(outros))
+        for col, pessoa in zip(cols_dev, outros):
+            deve = sum(
+                r['ValorPorPessoa'] for _, r in compras.iterrows() if pessoa in r['DivididoCom']
+            )
+            col.metric(f"👤 {pessoa.title()}", f"R$ {deve:.2f}")
+
+    # ── Detalhamento por pessoa ────────────────────────────────────────────
+    st.subheader("🧾 Detalhamento por pessoa")
     for pessoa in lista_pessoas:
-        st.markdown(f"### 👤 {pessoa}")
-        dados = []
-        for _, row in df.iterrows():
-            if pessoa in row['DivididoPor']:
-                dados.append({
-                    'Data': row['Data'].strftime('%d/%m/%Y'),
-                    'Descrição': row['Descrição'],
-                    'Parcela': row['Parcela'],
-                    'Valor total': f"R$ {row['Valor']:.2f}",
-                    'Participantes': ", ".join(row['DivididoPor']),
-                    'Valor pago por essa pessoa': f"R$ {row['ValorPorPessoa']:.2f}"
-                })
-        if dados:
-            detalhado_df = pd.DataFrame(dados)
-            st.dataframe(detalhado_df)
-        else:
-            st.write("Nenhuma transação atribuída a esta pessoa.")
+        label_exp = f"👤 {usuario.title()} (você)" if pessoa == usuario else f"👤 {pessoa.title()}"
+        total_p = sum(r['ValorPorPessoa'] for _, r in compras.iterrows() if pessoa in r['DivididoCom'])
 
-    st.subheader("📥 Gerar planilha")
-    nome_excel = f"fatura_dividida_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        with st.expander(f"{label_exp} — R$ {total_p:.2f}"):
+            dados = [
+                {
+                    'Data': r['Data'].strftime('%d/%m/%Y'),
+                    'Descrição': r['Descrição'],
+                    'Parcela': r['Parcela'],
+                    'Categoria': r['Categoria'],
+                    'Valor total': f"R$ {r['Valor']:.2f}",
+                    'Divide com': ', '.join(r['DivididoCom']),
+                    'Valor pago': f"R$ {r['ValorPorPessoa']:.2f}",
+                }
+                for _, r in compras.iterrows()
+                if pessoa in r['DivididoCom']
+            ]
+            if dados:
+                st.dataframe(pd.DataFrame(dados), use_container_width=True)
+            else:
+                st.write("Nenhuma despesa.")
+
+    # ── Exportar Excel ─────────────────────────────────────────────────────
+    st.subheader("📥 Exportar planilha")
     if st.button("📁 Gerar Excel"):
-        gerar_excel(df, nome_excel, lista_pessoas, total_individual)
-        with open(nome_excel, 'rb') as f:
-            st.download_button("⬇️ Baixar Excel", f, file_name=nome_excel)
-        os.remove(nome_excel)
+        nome = f"fatura_{usuario}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        gerar_excel(compras, nome, lista_pessoas, usuario)
+        with open(nome, 'rb') as f:
+            st.download_button("⬇️ Baixar Excel", f, file_name=nome)
+        os.remove(nome)
 
     conn.close()
