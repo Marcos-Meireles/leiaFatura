@@ -28,6 +28,39 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+### Atalho no Desktop / Menu Iniciar (Windows)
+
+Há um atalho **"Divisor de Fatura"** já criado na Área de Trabalho e no Menu
+Iniciar, com ícone próprio (`assets/icon.ico`), que aponta direto para
+`.venv\Scripts\streamlit.exe run app.py`. Basta dar duplo-clique para abrir
+o app no navegador.
+
+Se mover a pasta do projeto, refaça o atalho (o caminho é absoluto):
+
+```powershell
+$proj = "CAMINHO\PARA\leiaFatura"
+$exe  = Join-Path $proj ".venv\Scripts\streamlit.exe"
+$ico  = Join-Path $proj "assets\icon.ico"
+$shell = New-Object -ComObject WScript.Shell
+foreach ($lnkPath in @(
+    (Join-Path ([Environment]::GetFolderPath("Desktop")) "Divisor de Fatura.lnk"),
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Divisor de Fatura.lnk")
+)) {
+    $sc = $shell.CreateShortcut($lnkPath)
+    $sc.TargetPath = $exe
+    $sc.Arguments = "run app.py"
+    $sc.WorkingDirectory = $proj
+    $sc.IconLocation = "$ico,0"
+    $sc.WindowStyle = 7
+    $sc.Save()
+}
+```
+
+> O atalho aponta direto para o `.exe` do Streamlit dentro do `.venv` — não
+> para um `.bat`/`.vbs` — porque alguns Windows com *Smart App Control*
+> bloqueiam scripts `.bat`/`.vbs` iniciados por atalho ("Extensão de arquivo
+> perigosa do web"), mas não bloqueiam executáveis.
+
 O app abre no navegador (geralmente em `http://localhost:8501`).
 
 ## Como usar
